@@ -61,8 +61,38 @@ python -m gunicorn --bind 0.0.0.0:8000 --threads 4 wsgi:app
   标签、待补全状态永远保持当时结果。
 - 每批在一个 `BEGIN IMMEDIATE` 事务内完成对象写入与状态翻转；失败即 ROLLBACK，
   只留下标记 rejected 的批次审计行，不留半批。
-- 进程重启时，启动钩子把残留 `processing` 批次的对象行清除并标记拒绝（崩溃恢复）。
 - WAL + 只读快照查询：导出 GeoJSON 不开启写事务，导出期间新批次仍可提交。
+
+## 双 worker 启动恢复与在途批次
+
+服务默认以 gunicorn 两个 worker 进程共享同一个 SQLite 库（同一命名卷）。批次行在
+解析**开始前**就以 `processing` 建立，所以启动恢复不能把所有 `processing` 批次都
+当成崩溃残留：
+
+- 每个 worker 启动时登记到 `workers` 表（唯一 `worker_id`、pid、主机、boot id、
+  `/proc` 启动时间、心跳），并在整个进程生命周期内持有
+  `<db>.worker-<id>.lock` 的内核 `flock`；锁随进程退出自动释放。
+- 批次行和对象行都记录所属 worker。启动恢复只接管**可证明死亡**的 worker 的
+  在途批次：同机用 pid + `/proc` 启动时间（僵尸进程视为死亡），跨容器优先用
+  内核 flock，再退化为心跳租约（`OSM_WORKER_LEASE_SECONDS`，默认 120 秒；
+  心跳间隔 `OSM_WORKER_HEARTBEAT_SECONDS`，默认 10 秒）。
+- 存活 worker 的 `processing` 批次既不改状态也不删对象行；解析期间的其它上传、
+  状态查询、历史批次下载照常完成。
+- 死亡 worker 的批次由替补 worker 在启动时**整批**处理：同一事务内条件校验
+  （仍是 `processing` 且仍属于该死 worker）→ 删除残留对象行 → 标记 rejected。
+- 提交侧同样带守卫：最终事务在 `BEGIN IMMEDIATE` 内复查批次仍归本 worker 且仍为
+  `processing`，状态翻转也带同样条件。若恢复已经接管，本次提交整体回滚并抛
+  `BatchTakenOver`，不会把已拒绝的批次“复活”，也不会留下半批。
+- 因此提交与恢复交错时，结果只会是「完整成功批」或「完整拒绝批」；成功批的
+  状态、对象行与图层不会被迟到的清理改动。
+
+### 升级已有卷
+
+启动时对旧库就地迁移：只 `ALTER TABLE ADD COLUMN` 增加
+`batches.worker_id` / `object_versions.owner_worker_id` 并补 `workers` 表，
+不重建表、不重排 id。已有批次的编号、详情页地址 `/batches/<id>`、下载文件名
+`batch_<id>_highways.geojson` 均保持不变；旧版本遗留的无主 `processing` 批次
+仍按崩溃残留整批拒绝。合并与版本规则完全沿用原实现。
 
 ## 样例文件（`samples/`，建议按编号顺序上传）
 
@@ -79,6 +109,15 @@ python -m gunicorn --bind 0.0.0.0:8000 --threads 4 wsgi:app
 | `09_recreate_node_higher_version.osc` | 只有更高版本才能重建已删除节点，墓碑历史保留 |
 | `10_relation_rejected.osm` | 含 relation，整批拒绝 |
 
+## 部署与运行
+
+`docker compose up --build` 会构建镜像并启动一个服务容器，容器内的 gunicorn
+以 **2 个 worker 进程**共享 `/data` 卷上的同一个 SQLite 库（WAL 模式）。健康检查
+通过后才算就绪；`restart: unless-stopped` 让异常退出的容器被重新拉起，新容器的
+启动恢复会整批拒绝上一个容器遗留的在途批次。若要多副本，去掉 compose 中固定的
+宿主端口映射后再 `--scale`（未固定 `container_name`）；所有实例共享同一命名卷，
+跨容器存活判定依靠内核 flock 与心跳租约。
+
 ## 测试
 
 ```bash
@@ -86,22 +125,25 @@ pip install pytest
 python -m pytest tests/ -v
 ```
 
-23 个用例覆盖：版本合并全部规则、缺节点补全、共享节点联动、改线、乱序、
-整批原子性、批次快照不可变、HTTP 上传/下载、并发写入与崩溃恢复。
+33 个用例覆盖：版本合并全部规则、缺节点补全、共享节点联动、改线、乱序、
+整批原子性、批次快照不可变、HTTP 上传/下载、并发写入与崩溃恢复，
+以及多 worker 存活判定、在途批次不被接管、死亡 worker 替补恢复、
+提交/恢复交错、旧库就地升级。
 
 ## 目录结构
 
 ```
 app/
   config.py       环境变量配置
-  db.py           SQLite 连接、建表、重启恢复
+  db.py           SQLite 连接、建表/迁移、启动恢复
+  worker.py       worker 登记、存活判定（flock / pid / 心跳）、批次租约
   osm_parser.py   .osm/.osc 严格解析（defusedxml）
   ingestion.py    批次合并规则与单事务入仓
   roads.py        as-of 快照重建、待补全判定、GeoJSON 序列化
   web.py          Flask 路由
   templates/      中文网页模板
 samples/          10 个场景样例
-tests/            pytest 测试（23 用例）
+tests/            pytest 测试（33 用例）
 wsgi.py           gunicorn 入口
 Dockerfile / docker-compose.yml
 ```

@@ -16,6 +16,14 @@ Merge semantics for every parsed element, keyed by (object type, id, version):
 
 All of this happens inside one ``BEGIN IMMEDIATE`` transaction together with
 the batch's status flip, so each batch takes effect atomically.
+
+With several worker processes sharing the database, the batch row is created
+up-front as ``processing`` and tagged with the owning worker.  A startup
+recovery running in another process may reject batches owned by *dead*
+workers, so the final transaction re-checks inside ``BEGIN IMMEDIATE`` that
+this batch is still owned by this worker and still ``processing``.  If a
+recovery took it over, the ingestion rolls back instead of resurrecting a
+rejected batch (``BatchTakenOver``).
 """
 from __future__ import annotations
 
@@ -24,6 +32,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from .osm_parser import ParsedElement, parse_osm, OSMParseError
+from .worker import BatchTakenOver, batch_started
 
 COORD_DECIMALS = 7  # OSM stores at most 7 decimal places (~1 cm).
 
@@ -80,10 +89,18 @@ def ingest_stream(conn: sqlite3.Connection, filename: str, stream) -> IngestResu
     # 1. Reserve the batch id in its own (auto-commit) statement first, so
     #    that even a parse/validation failure leaves an auditable rejected
     #    batch row while no object row can survive (the object transaction
-    #    is only opened afterwards).
-    cur = conn.execute(
-        "INSERT INTO batches (filename, status) VALUES (?, 'processing')", (filename,)
-    )
+    #    is only opened afterwards).  The row is tagged with this worker so
+    #    other workers' startup recovery can tell live from abandoned work.
+    lease = batch_started(conn)
+    try:
+        cur = conn.execute(
+            "INSERT INTO batches (filename, status, worker_id) "
+            "VALUES (?, 'processing', ?)",
+            (filename, lease.worker_id),
+        )
+    except Exception:
+        lease.finish()
+        raise
     batch_id = cur.lastrowid
 
     result = IngestResult(batch_id=batch_id, filename=filename)
@@ -96,9 +113,28 @@ def ingest_stream(conn: sqlite3.Connection, filename: str, stream) -> IngestResu
         # Parse inside the guarded region: malformed input marks the batch
         # rejected instead of leaving an untracked failure.
         elements = parse_osm(stream)
+        lease.heartbeat_now(conn)
 
         # One write transaction for every object row and the status flip.
         conn.execute("BEGIN IMMEDIATE")
+        guard = conn.execute(
+            "SELECT status, worker_id FROM batches WHERE id = ?", (batch_id,)
+        ).fetchone()
+        if (
+            guard is None
+            or guard["status"] != "processing"
+            or guard["worker_id"] != lease.worker_id
+        ):
+            # A recovery in another process declared this batch abandoned
+            # (this worker was considered dead) and rejected it. Do not
+            # resurrect it or re-add rows: the batch must stay a complete
+            # rejection.
+            conn.execute("ROLLBACK")
+            raise BatchTakenOver(
+                f"批次 #{batch_id} 已被启动恢复接管并拒绝（worker 租约丢失），"
+                "本次提交放弃"
+            )
+
         for el in elements:
             key = (el.object_type, el.object_id, el.version)
             payload = canonical_payload(el)
@@ -147,7 +183,8 @@ def ingest_stream(conn: sqlite3.Connection, filename: str, stream) -> IngestResu
 
             conn.execute(
                 "INSERT INTO object_versions (object_type, object_id, version, visible, "
-                "lat, lon, tags_json, refs_json, batch_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "lat, lon, tags_json, refs_json, batch_id, owner_worker_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     el.object_type,
                     el.object_id,
@@ -158,6 +195,7 @@ def ingest_stream(conn: sqlite3.Connection, filename: str, stream) -> IngestResu
                     payload[3],
                     payload[4],
                     batch_id,
+                    lease.worker_id,
                 ),
             )
             seen_in_file[key] = payload
@@ -166,24 +204,45 @@ def ingest_stream(conn: sqlite3.Connection, filename: str, stream) -> IngestResu
             else:
                 result.inserted_ways += 1
 
-        conn.execute(
-            "UPDATE batches SET status = 'committed', error = NULL WHERE id = ?",
-            (batch_id,),
+        cur = conn.execute(
+            "UPDATE batches SET status = 'committed', error = NULL "
+            "WHERE id = ? AND status = 'processing' AND worker_id = ?",
+            (batch_id, lease.worker_id),
         )
+        if cur.rowcount != 1:
+            # The row changed state between the guard read and the update
+            # (must not happen while we hold the write lock, but never leave
+            # object rows behind without a committed batch).
+            conn.execute("ROLLBACK")
+            raise BatchTakenOver(
+                f"批次 #{batch_id} 状态已被并发修改，本次提交放弃"
+            )
         conn.execute("COMMIT")
+    except BatchTakenOver:
+        # Recovery already rejected the batch (and removed any rows); leave
+        # that complete rejection exactly as it is.
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        raise
     except (BatchRejected, OSMParseError) as exc:
         conn.rollback()
         conn.execute(
-            "UPDATE batches SET status = 'rejected', error = ? WHERE id = ?",
-            (str(exc), batch_id),
+            "UPDATE batches SET status = 'rejected', error = ? "
+            "WHERE id = ? AND status = 'processing' AND worker_id = ?",
+            (str(exc), batch_id, lease.worker_id),
         )
         raise
     except Exception as exc:
         conn.rollback()
         conn.execute(
-            "UPDATE batches SET status = 'rejected', error = ? WHERE id = ?",
-            (f"入仓过程发生异常，事务已回滚: {exc!r}", batch_id),
+            "UPDATE batches SET status = 'rejected', error = ? "
+            "WHERE id = ? AND status = 'processing' AND worker_id = ?",
+            (f"入仓过程发生异常，事务已回滚: {exc!r}", batch_id, lease.worker_id),
         )
         raise
+    finally:
+        lease.finish(conn)
 
     return result

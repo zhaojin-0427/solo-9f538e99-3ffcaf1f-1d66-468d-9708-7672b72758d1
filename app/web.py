@@ -15,6 +15,7 @@ from .db import connect, init_db
 from .ingestion import BatchRejected, ingest_stream
 from .osm_parser import OSMParseError
 from .roads import batch_summary, build_road_layer, road_geojson
+from .worker import BatchTakenOver
 
 
 def create_app(db_path=None) -> Flask:
@@ -79,6 +80,9 @@ def create_app(db_path=None) -> Flask:
         conn = get_conn()
         try:
             result = ingest_stream(conn, filename, io.BytesIO(data))
+        except BatchTakenOver as exc:
+            flash(f"批次未提交：{exc}", "error")
+            return redirect(url_for("index"))
         except (BatchRejected, OSMParseError) as exc:
             reason = str(exc)
             flash(f"批次被拒绝：{reason}", "error")

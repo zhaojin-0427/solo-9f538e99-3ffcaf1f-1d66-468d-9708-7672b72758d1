@@ -2,7 +2,8 @@ services:
   osm-batch:
     build: .
     image: osm-batch-ingest:latest
-    container_name: osm-batch-ingest
+    # Do not pin container_name: `docker compose up --scale` then works, and
+    # every replica is an independent pair of workers sharing the volume.
     ports:
       - "8000:8000"
     environment:
@@ -10,16 +11,28 @@ services:
       OSM_SECRET_KEY: "change-me-in-production"
       OSM_DATA_DIR: "/data"
       OSM_MAX_UPLOAD_BYTES: "268435456"
+      # Cross-container liveness lease (same-container workers use flock and
+      # /proc and are detected immediately). Tune for long parses if you run
+      # workers in separate containers.
+      OSM_WORKER_LEASE_SECONDS: "120"
+      OSM_WORKER_HEARTBEAT_SECONDS: "10"
+      # The image's CMD already runs `--workers 2 --threads 4`. gunicorn
+      # merges GUNICORN_CMD_ARGS with that CMD, so tune here without an
+      # image rebuild if needed.
+      # GUNICORN_CMD_ARGS: "--workers 2 --threads 4 --timeout 120"
     volumes:
       - osm_batch_data:/data
       # Sample files are mounted for manual try-outs; not required at runtime.
       - ./samples:/samples:ro
     restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
       interval: 15s
       timeout: 5s
       retries: 5
+      start_period: 10s
 
 volumes:
   osm_batch_data:

@@ -31,3 +31,10 @@ ALLOWED_EXTENSIONS = {".osm", ".osc"}
 # Flask secret key (session/flash messages). A random one is generated when
 # the variable is absent; restarting the container then invalidates sessions.
 SECRET_KEY = os.environ.get("OSM_SECRET_KEY", "dev-insecure-secret-change-me")
+
+# How long a worker may go without refreshing its heartbeat before another
+# process may consider its in-flight batch abandoned. Only used when the
+# worker runs on a different host/boot than the one doing recovery; same-host
+# liveness is checked against /proc and is authoritative.
+WORKER_LEASE_SECONDS = _env_int("OSM_WORKER_LEASE_SECONDS", 120)
+WORKER_HEARTBEAT_SECONDS = _env_int("OSM_WORKER_HEARTBEAT_SECONDS", 10)
